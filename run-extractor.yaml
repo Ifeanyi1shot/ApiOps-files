@@ -1,0 +1,253 @@
+parameters:
+  - name: APIM_INSTANCE_NAME
+    displayName: APIM instance name
+    type: string
+    default: api-si-dev-eastus
+  - name: RESOURCE_GROUP_NAME
+    displayName: APIM instance resource group name
+    type: string
+    default: rg-si-art-svc-dev-eastus
+  - name: APIM_REPOSITORY_NAME
+    type: string
+    displayName: APIM repository for pull request
+    default: Litera.DevOps.APIOpsTesting
+  - name: API_MANAGEMENT_SERVICE_OUTPUT_FOLDER_PATH
+    type: string
+    displayName: Folder where you want to extract the artifacts
+    default: artifacts
+  - name: TARGET_BRANCH_NAME
+    type: string
+    displayName: Target branch for pull request
+    default: main
+  - name: CONFIGURATION_YAML_PATH
+    type: string
+    displayName: Optional configuration file
+    values:
+      - Extract All
+      - configuration.extractor.yaml
+  - name: API_SPECIFICATION_FORMAT
+    type: string
+    displayName: API Specification Format
+    values:
+      - OpenAPIV3Yaml
+      - OpenAPIV3Json
+      - OpenAPIV2Yaml
+      - OpenAPIV2Json
+    default: OpenAPIV3Yaml
+  - name: AZURE_SUBSCRIPTION_ID
+    type: string
+    displayName: Azure Subscription ID
+    default: ''
+
+pr: none
+
+trigger: none
+
+variables:
+  - group: apim-automation
+  - name: System.Debug
+    value: true
+  - name: AZURE_SUBSCRIPTION_ID
+    value: ${{ parameters.AZURE_SUBSCRIPTION_ID }}
+  - name: GH_TOKEN
+    value: $(GITHUB_PAT)
+
+stages:
+  - stage: create_artifact_from_portal
+    displayName: Create artifact from portal
+    jobs:
+      - job: create_artifact_from_portal
+        displayName: Create artifact from portal
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: AzureCLI@2
+            displayName: Set extraction variables
+            inputs:
+              azureSubscription: "$(SERVICE_CONNECTION_NAME)"
+              scriptType: pscore
+              scriptLocation: inlineScript
+              inlineScript: |
+                Set-StrictMode -Version Latest
+                $ErrorActionPreference = "Stop"
+                $VerbosePreference = "Continue"
+                $InformationPreference = "Continue"
+
+                Write-Host "##vso[task.setvariable issecret=true;variable=AZURE_BEARER_TOKEN]$(az account get-access-token --query 'accessToken' --output tsv)"
+                Write-Host "##vso[task.setvariable issecret=true;variable=AZURE_CLIENT_ID]$env:servicePrincipalId"
+                Write-Host "##vso[task.setvariable issecret=true;variable=AZURE_CLIENT_SECRET]$env:servicePrincipalKey"
+                Write-Host "##vso[task.setvariable issecret=true;variable=AZURE_TENANT_ID]$env:tenantId"
+                
+                if (-not $env:AZURE_SUBSCRIPTION_ID) {
+                    $subscriptionCount = az account list --query "length([])" --output tsv
+                    if ($subscriptionCount -eq 1) {
+                        $subscriptionId = az account list --query "[0].id" --output tsv
+                        Write-Host "Setting AZURE_SUBSCRIPTION_ID environment variable to: $subscriptionId"
+                        Write-Host "##vso[task.setvariable issecret=true;variable=AZURE_SUBSCRIPTION_ID]$($subscriptionId)"
+                    } 
+                    elseif ($subscriptionCount -gt 1) {
+                        Write-Host "Multiple subscriptions are accessible. Please set the AZURE_SUBSCRIPTION_ID environment variable manually."
+                        exit 1
+                    }
+                }
+                else {
+                  Write-Host "AZURE_SUBSCRIPTION_ID is already set to: $env:AZURE_SUBSCRIPTION_ID"
+                }
+              addSpnToEnvironment: true
+              failOnStandardError: true
+
+          - task: PowerShell@2
+            displayName: Fetch extractor
+            inputs:
+              targetType: "inline"
+              script: |
+                Set-StrictMode -Version Latest
+                $ErrorActionPreference = "Stop"
+                $VerbosePreference = "Continue"
+                $InformationPreference = "Continue"
+
+                Write-Information "Setting name variables..."
+                $releaseFileName = "extractor-linux-x64.zip"
+                $executableFileName = "extractor"
+
+                if ("$(Agent.OS)" -like "win*") {
+                  $releaseFileName = "extractor-win-x64.zip"
+                  $executableFileName = "extractor.exe"
+                }
+                elseif ("$(Agent.OS)" -like "mac*" -and "$(Agent.OSArchitecture)" -like "arm*") {
+                  $releaseFileName = "extractor-osx-arm64.zip"
+                }
+                elseif ("$(Agent.OS)" -like "mac*" -and "$(Agent.OSArchitecture)" -like "x86_64*") {
+                  $releaseFileName = "extractor-osx-x64.zip"
+                }
+
+                Write-Information "Downloading release..."
+                $uri = "https://github.com/Azure/apiops/releases/download/$(apiops_release_version)/$releaseFileName"
+                $downloadFilePath = Join-Path "$(Agent.TempDirectory)" $releaseFileName
+                Invoke-WebRequest -Uri "$uri" -OutFile "$downloadFilePath"
+
+                Write-Information "Extracting release..."
+                $executableFolderPath = Join-Path "$(Agent.TempDirectory)" "extractor"
+                Expand-Archive -Path "$downloadFilePath" -DestinationPath "$executableFolderPath"
+                $executableFilePath = Join-Path "$executableFolderPath" $executableFileName
+
+                Write-Information "Setting file permissions..."
+                if ("$(Agent.OS)" -like "linux*")
+                {
+                  & chmod +x "$executableFilePath"
+                  if ($LASTEXITCODE -ne 0) { throw "Setting file permissions failed."}
+                }
+
+                Write-Host "##vso[task.setvariable variable=EXTRACTOR_FILE_PATH]$executableFilePath"
+                Write-Information "Execution complete."
+              pwsh: true
+
+          - task: PowerShell@2
+            displayName: Run extractor
+            inputs:
+              targetType: "inline"
+              script: |
+                Set-StrictMode -Version Latest
+                $ErrorActionPreference = "Stop"
+                $VerbosePreference = "Continue"
+                $InformationPreference = "Continue"
+
+                & "$(EXTRACTOR_FILE_PATH)"
+                if ($LASTEXITCODE -ne 0) { throw "Running extractor failed."}
+
+                Write-Information "Execution complete."
+              pwsh: true
+            env:
+              AZURE_BEARER_TOKEN: $(AZURE_BEARER_TOKEN)
+              AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+              AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+              AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+              AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+              AZURE_RESOURCE_GROUP_NAME: ${{ parameters.RESOURCE_GROUP_NAME }}
+              API_MANAGEMENT_SERVICE_NAME: ${{ parameters.APIM_INSTANCE_NAME }}
+              API_MANAGEMENT_SERVICE_OUTPUT_FOLDER_PATH: $(Build.ArtifactStagingDirectory)/${{ parameters.API_MANAGEMENT_SERVICE_OUTPUT_FOLDER_PATH }}
+              API_SPECIFICATION_FORMAT: ${{ parameters.API_SPECIFICATION_FORMAT }}
+              ${{ if ne(parameters['CONFIGURATION_YAML_PATH'], 'Extract All') }}:
+                CONFIGURATION_YAML_PATH: ${{ parameters.CONFIGURATION_YAML_PATH }}
+
+          # Extract APIs
+          - task: PowerShell@2
+            displayName: Extract APIs
+            inputs:
+              targetType: 'inline'
+              script: |
+                Set-StrictMode -Version Latest
+                $ErrorActionPreference = "Stop"
+                $VerbosePreference = "Continue"
+                $InformationPreference = "Continue"
+
+                Write-Host "Extracting APIs..."
+                & "$(EXTRACTOR_FILE_PATH)" apis --output-folder $(Build.ArtifactStagingDirectory)/${{ parameters.API_MANAGEMENT_SERVICE_OUTPUT_FOLDER_PATH }}/apis
+                if ($LASTEXITCODE -ne 0) { throw "Extracting APIs failed." }
+              pwsh: true
+            env:
+              AZURE_BEARER_TOKEN: $(AZURE_BEARER_TOKEN)
+              AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+              AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+              AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+              AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+              AZURE_RESOURCE_GROUP_NAME: ${{ parameters.RESOURCE_GROUP_NAME }}
+              API_MANAGEMENT_SERVICE_NAME: ${{ parameters.APIM_INSTANCE_NAME }}
+              API_MANAGEMENT_SERVICE_OUTPUT_FOLDER_PATH: $(Build.ArtifactStagingDirectory)/${{ parameters.API_MANAGEMENT_SERVICE_OUTPUT_FOLDER_PATH }}
+              
+          # Create a new branch and push the changes
+          - task: PowerShell@2
+            displayName: Create new branch and push changes
+            inputs:
+              targetType: 'inline'
+              script: |
+                Set-StrictMode -Version Latest
+                $ErrorActionPreference = "Stop"
+                $VerbosePreference = "Continue"
+                $InformationPreference = "Continue"
+
+                # Set up Git environment
+                git config --global user.email "olayinka.olasele@litera.com"
+                git config --global user.name "Litera-Dev"
+
+                # Clone repository
+                # git clone https://$(GITHUB_PAT)@github.com/${{ parameters.APIM_REPOSITORY_NAME }} $(Build.SourcesDirectory)/repo
+                git clone https://$(GITHUB_PAT)@github.com/Litera-Dev/Litera.DevOps.APIOpsTesting.git $(Build.SourcesDirectory)/repo
+
+                # Create a new branch
+                cd $(Build.SourcesDirectory)/repo
+                git checkout -b "extract_$(Build.BuildId)"
+
+                # Copy the extracted artifacts to the repository
+                cp -r $(Build.ArtifactStagingDirectory)/${{ parameters.API_MANAGEMENT_SERVICE_OUTPUT_FOLDER_PATH }}/* $(Build.SourcesDirectory)/repo
+
+                # Push the new branch to the repository
+                git add .
+                git commit -m "Extracted APIs, products, policies, named values, backend services, authorization servers, and service settings from APIM."
+                git push origin "extract_$(Build.BuildId)"
+
+                Write-Host "##vso[task.setvariable variable=NEW_BRANCH_NAME]extract_$(Build.BuildId)"
+              pwsh: true
+            env:
+              GITHUB_PAT: $(GITHUB_PAT)
+
+          # Create a pull request for the new branch
+          - task: PowerShell@2
+            displayName: Create pull request
+            timeoutInMinutes: 3
+            inputs:
+              targetType: 'inline'
+              script: |
+                Set-StrictMode -Version Latest
+                $ErrorActionPreference = "Stop"
+                $VerbosePreference = "Continue"
+                $InformationPreference = "Continue"
+
+                # Create pull request using GitHub CLI
+                gh auth login 
+                gh pr create --title "Extracted components from APIM" --body "Extracted APIs, products, policies, named values, backend services, authorization servers, and service settings from APIM." --base ${{ parameters.TARGET_BRANCH_NAME }} --head $(NEW_BRANCH_NAME) --repo https://github.com/Litera-Dev/Litera.DevOps.APIOpsTesting.git
+
+                Write-Host "Pull request created successfully."
+              pwsh: true
+            env:
+              GITHUB_PAT: $(GITHUB_PAT)
